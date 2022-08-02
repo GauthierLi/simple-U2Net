@@ -5,8 +5,12 @@
 # Description: train for cell segmentation.                                    #
 # ============================================================================ #                     
 
+from genericpath import isfile
 import os
+from subprocess import check_output
+import cv2
 import pdb
+import sys
 import PIL
 import time
 import torch
@@ -32,10 +36,10 @@ class cell_seg_dataset(Dataset):
         super().__init__()
         self.root = root
         self.transform = transform
-        if file_list is  None:
-            self.imgs = self._get_imgs_name(list(os.listdir(root)))[:5]
+        if file_list is None:
+            self.imgs = self._get_imgs_name(list(os.listdir(root)))
         else:
-            self.imgs = file_list
+            self.imgs = file_list[:3]
 
     def __len__(self):
         return len(self.imgs)
@@ -104,7 +108,7 @@ class Tversky(nn.Module):
         ground_truth = ground_truth.view(-1)
 
         PG = torch.sum(pred * ground_truth)
-        P_d_G = torch.sum(pred * (1-ground_truth))
+        P_d_G = torch.sum(pred * (1 - ground_truth))
         G_d_P = torch.sum((1 - pred) * ground_truth)
 
         tversky = (PG + self.smooth) / (PG + self.alpha * P_d_G + self.gamma * G_d_P + self.smooth)
@@ -116,14 +120,14 @@ def build_tversky(alpha=0.3, gamma=0.7):
 def build_bce_loss():
     return nn.BCEWithLogitsLoss()
 
-def build_dice_loss():
+def build_dice():
     return build_tversky(alpha=0.5, gamma=0.5)
 
 def build_loss( alpha=0.3, gamma=0.7):
     bce_loss = build_bce_loss()
-    dice_loss = build_dice_loss()
-    tversky_loss = build_tversky(alpha=alpha, gamma=gamma)
-    return {"bce_loss": bce_loss, "dice_loss":dice_loss, "tversky_loss":tversky_loss}
+    dice = build_dice()
+    tversky = build_tversky(alpha=alpha, gamma=gamma)
+    return {"bce_loss": bce_loss, "dice":dice, "tversky":tversky}
 
 
 # =============================================================================================================
@@ -145,11 +149,11 @@ def train_one_epoch(CFG, model, train_loader, optimizer):
     model.train()
     model.to(CFG.device)
     total_loss, total_bce_loss, total_tversky_loss = 0., 0., 0.
-    scaler = torch.cuda.amp.GradScaler()
+    # scaler = torch.cuda.amp.GradScaler()
 
     avg_dice_score = []
 
-    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Train")
+    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Train", file=sys.stdout)
 
     for _, (images, masks) in pbar:
         images = images.to(CFG.device, dtype=torch.float)
@@ -158,48 +162,86 @@ def train_one_epoch(CFG, model, train_loader, optimizer):
 
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=True):
-            outputs = model(images) # 7 feature maps tuple
-            tmp_dice_list = []
-            for i in range(7):
-                bce_LV = losses["bce_loss"](outputs[i], masks) # Loss Value
-                tversky_LV = 1 - losses["tversky_loss"](outputs[i], masks)
-                dice_LV = 1 - losses["dice_loss"](outputs[i], masks)
+        # with torch.cuda.amp.autocast(enabled=True):
+        outputs = model(images) # 7 feature maps tuple
+        viewer(images,masks, outputs[6])
+        tmp_dice_list = []
 
-                total_LV = 0.5 * (bce_LV + dice_LV) + 0.5 * tversky_LV
-                # pdb.set_trace()
+        for i in range(len(outputs)):
+            bce_LV = losses["bce_loss"](outputs[i], masks) # Loss Value
+            tversky_LV = torch.pow(1 - losses["tversky"](outputs[i], masks), 0.75)
+            dice_LV = 1 - losses["dice"](outputs[i], masks)
 
-                tmp_dice_list.append((1 - dice_LV).cpu().detach().numpy())
+            total_LV = bce_LV + dice_LV +  tversky_LV
+
+            tmp_dice_list.append(1 - dice_LV.item())
+            total_loss += total_LV.item()
+            total_bce_loss += bce_LV.item()
+            total_tversky_loss += tversky_LV.item()
+
+        avg_dice_score.append(np.mean(np.array(tmp_dice_list)))
+        # tqdm.write("loss : {:.3f}, bce : {:.3f}, tversky : {:.3f}, dice : {:.3f}".format(total_loss, total_bce_loss, total_tversky_loss, avg_dice_score))
+    
         
-            avg_dice_score.append(np.mean(np.array(tmp_dice_list)))
-        
-        # total_LV.backward()
-        # optimizer.step()
-        scaler.scale(total_LV).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        total_LV.backward()
+        optimizer.step()
+        # scaler.scale(total_LV).backward()
+        # scaler.step(optimizer)
+        # scaler.update()
 
-        total_loss += total_LV.item() / (7 * images.shape[0])
-        total_bce_loss += total_LV.item() / (7 * images.shape[0])
-        total_tversky_loss += tversky_LV.item() / (7 * images.shape[0])
+        total_loss = total_loss / (7 * images.shape[0])
+        total_bce_loss = total_bce_loss / (7 * images.shape[0])
+        total_tversky_loss = total_tversky_loss / (7 * images.shape[0])
+
 
     train_dice_score = np.mean(avg_dice_score)
-    print("Training dice: {:.4f}".format(train_dice_score), flush=True)
 
     current_lr = optimizer.param_groups[0]['lr']
     print("lr:{:.6f}".format(current_lr), flush=True)
+    print("Training dice: {:.4f}".format(train_dice_score), flush=True)
 
     print("loss : {:.3f}, bce : {:.3f}, tversky : {:.3f}".format(total_loss, total_bce_loss, total_tversky_loss), flush=True)
 
 
-
 # 8,valid_one_epoch
+@torch.no_grad()
+def valid_one_epoch(CFG,  model, valid_loader):
+    model.to(CFG.device)
+    model.eval()
+    dice = []
+    metric = build_dice()
+    pbar = tqdm(enumerate(valid_loader), total=len(valid_loader), desc="Valid", file=sys.stdout)
+    for _, (images, masks) in pbar:
+        images = images.to(CFG.device)
+        masks = masks.to(CFG.device)
+
+        outputs = model(images)
+
+        for i in range(len(outputs)):
+            dice.append(metric(outputs[i], masks).item())
+    
+    dice = np.mean(np.array(dice))
+    print("Valid dice {:.4f}".format(dice), flush=True)
+    return dice
+    
+
 # 9,test_one_epoch
-# 10, CFG (lr, warm up with cosine annealing)
 
 # ===========================================================================================
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> utils <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> utils <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # ===========================================================================================
+def  viewer(img, mask, pred):
+    img = (img.cpu().detach().numpy()[0].transpose((1,2,0)) * 255).astype("uint8")
+    mask = (mask[0].squeeze().cpu().detach().numpy() * 255).astype("uint8")
+    pred = (pred[0].squeeze().cpu().detach().numpy() * 255).astype("uint8")
+    
+    mask = np.stack([mask, mask, mask], axis=2)
+    pred = np.stack([pred, pred, pred], axis=2)
+
+    total = np.hstack([img, mask, pred])
+    cv2.imshow("view", total)
+    cv2.waitKey(1)
+
 
 
 if __name__ == "__main__":
@@ -233,7 +275,9 @@ if __name__ == "__main__":
     #     pred = model(img)
     #     pdb.set_trace()
     #     break
-
+    if not os.path.exists(CFG.ckpt_path):
+        os.makedirs(CFG.ckpt_path)
+    
     
     train_flag = True
     if train_flag:
@@ -245,17 +289,24 @@ if __name__ == "__main__":
         best_val_dice = 0
         best_epoch = 0
 
+        best_epoch = 0
         for epoch in range(CFG.epoch):
             optimizer = torch.optim.AdamW(model.parameters(), lr = CFG.lr, weight_decay=CFG.wd)
             lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,lr_lambda=lambda epoch:1/(epoch+1))
             start_time = time.time()
 
             train_one_epoch(CFG, model=model, train_loader=train_dataLoader,optimizer=optimizer)
+            dice = valid_one_epoch(CFG, model=model, valid_loader=val_dataLoader)
 
+            if dice > best_val_dice:
+                print("Saving best epoch ... ....", flush=True)
+                torch.save(model.state_dict(),os.path.join(CFG.ckpt_path, "best_epoch.pth"))
+            
+            print("saving last epoch ... ...", flush=True)
+            torch.save(model.state_dict(),os.path.join(CFG.ckpt_path, f"epoch_{epoch}.pth"))
+            if os.path.isfile(os.path.join(CFG.ckpt_path, f"epoch_{epoch - 1}.pth")):
+                os.remove(os.path.join(CFG.ckpt_path, f"epoch_{epoch - 1}.pth"))
 
-    # for img, label in train_dataLoader:
-    #     B,C,H,W = img.shape
-    #     fake_pred = torch.ones((B,1,H, W))
-    #     loss = build_loss(fake_pred, label)
-    #     print(loss["total_loss"])
-    #     break
+            epoch_time = time.time() - start_time
+            print("epoch:{}, time:{:.2f}s\n".format(epoch, epoch_time), flush=True)
+                

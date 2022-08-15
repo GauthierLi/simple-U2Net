@@ -23,6 +23,7 @@ from PIL import Image
 from tqdm import tqdm
 from zmq import device
 from model import U2NET, U2NETP
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 
@@ -45,7 +46,7 @@ class cell_seg_dataset(Dataset):
     def __getitem__(self, index):
         image = self.imgs[index]
         img = os.path.join(self.root,image + ".png")
-        img = Image.open(img)
+        img = Image.open(img).convert("RGB")
         label = os.path.join(self.root, image + "_label.png")
         label = Image.open(label).convert("L")
         if self.transform is not None:
@@ -98,7 +99,7 @@ def build_transforms(CFG):
 # 3,Augumentations ...
 # 4,build_loss (focal_tversky_loss, bce_loss, dice_loss)
 class Tversky(nn.Module):
-    smooth = 1
+    smooth = 1e-5
     def __init__(self,alpha=0.3, gamma=0.7, reduce=True):
         super(Tversky, self).__init__()
         self.alpha = alpha
@@ -107,26 +108,20 @@ class Tversky(nn.Module):
 
     def forward(self,pred:torch.Tensor, ground_truth:torch.Tensor):
         batch, _, _, _ = pred.shape
-        batch_tversky = []
+        pred_view = pred.view(batch, -1)
+        ground_truth_view = ground_truth.view(batch, -1)
+        
+        PG = (pred_view * ground_truth_view).sum(axis=1)
+        P_d_G = (pred_view * (1 - ground_truth_view)).sum(axis=1)
+        G_d_P = ((1 - pred_view) * ground_truth_view).sum(axis=1)
 
-        for i in range(batch):
-            pred_ = pred[i].view(-1)
-            ground_truth_ = ground_truth[i].view(-1)
-
-            PG = torch.sum(pred_ * ground_truth_)
-            P_d_G = torch.sum(pred_ * (1 - ground_truth_))
-            G_d_P = torch.sum((1 - pred_) * ground_truth_)
-
-
-            tversky = (PG + self.smooth) / (PG + self.alpha * P_d_G + self.gamma * G_d_P + self.smooth)
-            batch_tversky.append(tversky)
-        batch_tversky = torch.Tensor(batch_tversky)
-        batch_tversky_mean = batch_tversky.mean()
-
+        tversky = (PG + self.smooth) / (PG + self.alpha * P_d_G + self.gamma * G_d_P + self.smooth)
+        tversky_mean = tversky.mean()
+    
         if self.reduce:
-            return batch_tversky_mean
+            return tversky_mean
         else:
-            return batch_tversky
+            return tversky
 
 class Tversky_loss(nn.Module):
     def __init__(self,alpha=0.3, gamma=0.7):
@@ -252,7 +247,7 @@ def valid_one_epoch(CFG,  model, valid_loader):
 @torch.no_grad()
 def test_one_epoch(CFG, model, test_loader, view=True):
     model.to(CFG.device)
-    ckpt = os.path.join(CFG.ckpt_path, "best_epoch.pth")
+    ckpt = os.path.join(CFG.ckpt_path, "best_epoch_235.pth")
     assert os.path.isfile(ckpt), "checkpoints not exists ... ..."
     state_dict = torch.load(ckpt)
     model.load_state_dict(state_dict)
@@ -266,8 +261,9 @@ def test_one_epoch(CFG, model, test_loader, view=True):
         masks = masks.to(CFG.device)
 
         outputs = model(images)
-        outputs[0][outputs[0] > CFG.thr] = 1
-        outputs[0][outputs[0] < CFG.thr] = 0
+        if CFG.thr:
+            outputs[0][outputs[0] > CFG.thr] = 1
+            outputs[0][outputs[0] < CFG.thr] = 0
         # pdb.set_trace()
         viewer(images, masks, outputs[0], waitKey=1)
 
@@ -286,9 +282,15 @@ def  viewer(img, mask, pred, waitKey=1):
     img = (img.cpu().detach().numpy()[0].transpose((1,2,0)) * 255).astype("uint8")
     mask = (mask[0].squeeze().cpu().detach().numpy() * 255).astype("uint8")
     pred = (pred[0].squeeze().cpu().detach().numpy() * 255).astype("uint8")
+    zero_ = np.zeros_like(mask)
     
-    mask = np.stack([mask, mask, mask], axis=2)
-    pred = np.stack([pred, pred, pred], axis=2)
+    mask = np.stack([mask, zero_, mask], axis=2)
+    pred = np.stack([zero_, pred, zero_], axis=2)
+
+    alpha = 0.255
+    mask = (alpha * mask + (1 - alpha) * img).astype("uint8")
+    pred = (alpha * pred + (1 - alpha) * img).astype("uint8")
+
 
     total = np.hstack([img, mask, pred])
     cv2.imshow("view", total)
@@ -298,27 +300,32 @@ def  viewer(img, mask, pred, waitKey=1):
 
 if __name__ == "__main__":
     class CFG:
+        seed = 9422
         epoch = 150
         lr = 5e-4
         wd = 1e-6
         lr_drop = 10
 
         train_bs = 4
-        num_workers=8
+        num_workers=0
         valid_bs = train_bs * 2
-        img_size = (320,320)
+        img_size = (512,512)
+        # img_size = (320, 320)
+
+        n_fold = 4
 
         # inference
-        thr = 0.55
+        thr = 0.5
         early_stop = True
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         train_data = r"F:\data\cell_segmentation\train_data"
         test_data = r"F:\data\cell_segmentation\test_data"
-        # ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0] * img_size[1]}_thr{thr}")
-        ckpt_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 2)"
+        # ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0] * img_size[1]}_thr{thr}_{n_fold}fold")
+        ckpt_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 1)"
 
-        resume = True
+        resume = False
+        warm_up_epoch = 20
         resume_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(current best)\epoch_70.pth"
 
     # model = build_model().to(CFG.device)
@@ -343,20 +350,33 @@ if __name__ == "__main__":
             model.load_state_dict(state_dict)
         loss_dict = build_loss()
         train_transforms = build_transforms(CFG)["train"]
+
+        skf = StratifiedGroupKFold(n_splits=CFG.n_fold, shuffle=True, random_state=CFG.seed)
+
+
         train_dataLoader, val_dataLoader = build_dataLoader(CFG,CFG.train_data, batch_size=CFG.train_bs, transform=train_transforms)
-        optimizer = torch.optim.AdamW(model.parameters(), lr = CFG.lr, weight_decay=CFG.wd)
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer,lr_lambda=lambda epoch:1/(epoch+1))
+        
+        lr_scheduler_flag = True
         
         best_val_dice = 0
         best_epoch = 0
 
         best_epoch = 0
         for epoch in range(CFG.epoch):
-            
+            if epoch < CFG.warm_up_epoch:
+                epoch_percent = epoch / float(CFG.epoch)
+                optimizer = torch.optim.AdamW(model.parameters(), lr = CFG.lr * epoch_percent, weight_decay=CFG.wd)
+            else:
+                if lr_scheduler_flag:
+                    lr_scheduler_flag = False
+                    optimizer = torch.optim.AdamW(model.parameters(), lr = CFG.lr , weight_decay=CFG.wd)
+                    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=12, eta_min=2e-6)
             start_time = time.time()
 
             train_one_epoch(CFG, model=model, train_loader=train_dataLoader,optimizer=optimizer)
-            lr_scheduler.step()
+
+            if not lr_scheduler_flag:
+                lr_scheduler.step()
             dice = valid_one_epoch(CFG, model=model, valid_loader=val_dataLoader)
 
             if dice > best_val_dice:
@@ -376,5 +396,6 @@ if __name__ == "__main__":
     if test_flag:
         model = build_model()
         transform = build_transforms(CFG)["valid_test"]
-        test_dataloader = build_dataLoader(CFG, CFG.test_data,batch_size=8, transform=transform, split=1)
+        test_dataloader = build_dataLoader(CFG, CFG.test_data,batch_size=1, transform=transform, split=1)
+        train_dataLoader, val_dataLoader = build_dataLoader(CFG,CFG.train_data, batch_size=CFG.train_bs, transform=transform)
         test_one_epoch(CFG, model, test_dataloader)

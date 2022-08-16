@@ -6,6 +6,7 @@
 # ============================================================================ #                     
 
 import os
+from turtle import forward
 import cv2
 import pdb
 import sys
@@ -17,7 +18,9 @@ import random
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import torchvision.transforms as T
+import torchvision.transforms.functional as Tf
 
 from PIL import Image
 from tqdm import tqdm
@@ -50,7 +53,9 @@ class cell_seg_dataset(Dataset):
         label = os.path.join(self.root, image + "_label.png")
         label = Image.open(label).convert("L")
         if self.transform is not None:
-            img, label = self.transform["img"](img), self.transform["label"](label)
+            img, label = randRot(180)(img,label)
+            img, label = self.transform["img"](img), self.transform["img"](label)
+            
         return img, label
 
     @staticmethod
@@ -86,10 +91,19 @@ def build_dataLoader(CFG, root, batch_size=32, split=0.8, transform=None):
 # ============================================================================================================= 
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> 2,build_transforms <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< 
 # ============================================================================================================= 
+class randRot(nn.Module):
+    def __init__(self, degree):
+        super(randRot, self).__init__()
+        self.degree = np.random.randint(-degree, degree)
+
+    def forward(self, img, label):
+        return Tf.rotate(img, self.degree, fill=255), Tf.rotate(label, self.degree, fill=0)
+
 def build_transforms(CFG):
-    rand_rot = T.RandomRotation(3)
-    t = {"train":{"img":T.Compose([T.ToTensor(),rand_rot,  T.Resize(CFG.img_size)]),
-        "label":T.Compose([T.ToTensor(),rand_rot,  T.Resize(CFG.img_size)])},
+    rand_rot = [T.RandomVerticalFlip(p=1), T.RandomHorizontalFlip(p=1), T.Compose([T.RandomVerticalFlip(p=1), T.RandomHorizontalFlip(p=1)]), T.Compose([])]
+    rand_rot = np.random.choice(rand_rot, 1)[0]
+    t = {"train":{"img":T.Compose([T.ToTensor(), rand_rot,  T.Resize(CFG.img_size)]),
+        "label":T.Compose([T.ToTensor(), rand_rot,  T.Resize(CFG.img_size)])},
         "valid_test":{"img": T.Compose([T.ToTensor(), T.Resize(CFG.img_size)]),
         "label": T.Compose([T.ToTensor(), T.Resize(CFG.img_size)])}
         }
@@ -184,7 +198,7 @@ def train_one_epoch(CFG, model, train_loader, optimizer):
     
         # with torch.cuda.amp.autocast(enabled=True):
         outputs = model(images) # 7 feature maps tuple
-        viewer(images, masks, outputs[0])
+        viewer(images, masks, outputs[0], waitKey=1)
         tmp_dice_list = []
 
 
@@ -208,13 +222,10 @@ def train_one_epoch(CFG, model, train_loader, optimizer):
 
         avg_dice_score.append(np.mean(tmp_dice_list))
         # tqdm.write("loss : {:.3f}, bce : {:.3f}, tversky : {:.3f}, dice : {:.3f}".format(total_loss, total_bce_loss, total_tversky_loss, avg_dice_score))
-    
-
-        print("\nloss : {:.3f}, dice_score : {:.3f}".format(total_LV.item(), tmp_dice_list[-1]), flush=True)
+        # print("\nloss : {:.3f}, dice_score : {:.3f}".format(total_LV.item(), tmp_dice_list[-1]), flush=True)
 
 
     train_dice_score = np.mean(avg_dice_score)
-
     current_lr = optimizer.param_groups[0]['lr']
     print("lr:{:.6f}".format(current_lr), flush=True)
     print("Training dice: {:.4f}".format(train_dice_score), flush=True)
@@ -306,7 +317,7 @@ if __name__ == "__main__":
         wd = 1e-6
         lr_drop = 10
 
-        train_bs = 4
+        train_bs = 1
         num_workers=0
         valid_bs = train_bs * 2
         img_size = (512,512)
@@ -321,12 +332,12 @@ if __name__ == "__main__":
         device = "cuda" if torch.cuda.is_available() else "cpu"
         train_data = r"F:\data\cell_segmentation\train_data"
         test_data = r"F:\data\cell_segmentation\test_data"
-        # ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0] * img_size[1]}_thr{thr}_{n_fold}fold")
-        ckpt_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 1)"
+        ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0]}{img_size[1]}_thr{thr}_{n_fold}fold_with_warmup_mish")
+        # ckpt_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 1)"
 
-        resume = False
+        resume = True
         warm_up_epoch = 20
-        resume_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(current best)\epoch_70.pth"
+        resume_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 1)\best_epoch_512_7283.pth"
 
     # model = build_model().to(CFG.device)
     # train_transforms = build_transforms(CFG)["train"]
@@ -342,7 +353,7 @@ if __name__ == "__main__":
         os.makedirs(CFG.ckpt_path)
     
     model = build_model()
-    train_flag = False
+    train_flag = True
     if train_flag:
         if CFG.resume:
             assert os.path.isfile(CFG.resume_path), "resume not exist ... ..."
@@ -378,6 +389,7 @@ if __name__ == "__main__":
             if not lr_scheduler_flag:
                 lr_scheduler.step()
             dice = valid_one_epoch(CFG, model=model, valid_loader=val_dataLoader)
+            print("Current best val dice : {:.4f}".format(best_val_dice), flush=True)
 
             if dice > best_val_dice:
                 print("Saving best epoch ... ....", flush=True)
@@ -392,7 +404,7 @@ if __name__ == "__main__":
             epoch_time = time.time() - start_time
             print("epoch:{}, time:{:.2f}s\n".format(epoch, epoch_time), flush=True)
     
-    test_flag = True
+    test_flag = False
     if test_flag:
         model = build_model()
         transform = build_transforms(CFG)["valid_test"]

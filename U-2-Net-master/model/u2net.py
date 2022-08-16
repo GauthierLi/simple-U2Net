@@ -4,13 +4,21 @@ import torch.nn.functional as F
 
 from torch import sigmoid
 
+class Mish(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self,x):
+        out = x * torch.tanh(F.softplus(x))
+        return out
+
 class REBNCONV(nn.Module):
     def __init__(self,in_ch=3,out_ch=3,dirate=1):
         super(REBNCONV,self).__init__()
 
         self.conv_s1 = nn.Conv2d(in_ch,out_ch,3,padding=1*dirate,dilation=1*dirate)
         self.bn_s1 = nn.BatchNorm2d(out_ch)
-        self.relu_s1 = nn.ReLU(inplace=True)
+        self.relu_s1 = nn.LeakyReLU(inplace=True)
 
     def forward(self,x):
         
@@ -21,9 +29,7 @@ class REBNCONV(nn.Module):
 
 ## upsample tensor 'src' to have the same spatial size with tensor 'tar'
 def _upsample_like(src,tar):
-
     src = F.interpolate(src,size=tar.shape[2:],mode='bilinear')
-
     return src
 
 

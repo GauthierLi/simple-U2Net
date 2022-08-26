@@ -6,7 +6,6 @@
 # ============================================================================ #                     
 
 import os
-from turtle import forward
 import cv2
 import pdb
 import sys
@@ -24,7 +23,6 @@ import torchvision.transforms.functional as Tf
 
 from PIL import Image
 from tqdm import tqdm
-from zmq import device
 from model import U2NET, U2NETP
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset, DataLoader
@@ -34,10 +32,11 @@ from torch.utils.data.dataloader import default_collate
 # >>>>>>>>>>>>>>>>>>>>>>>>>> 1 build_dataset <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # ============================================================================
 class cell_seg_dataset(Dataset):
-    def __init__(self, root:str, transform=None, file_list=None) -> None:
+    def __init__(self, root:str, transform=None, file_list=None, train=True) -> None:
         super().__init__()
         self.root = root
         self.transform = transform
+        self.train = train
         if file_list is None:
             self.imgs = self._get_imgs_name(list(os.listdir(root)))
         else:
@@ -53,9 +52,10 @@ class cell_seg_dataset(Dataset):
         label = os.path.join(self.root, image + "_label.png")
         label = Image.open(label).convert("L")
         if self.transform is not None:
-            img, label = randRot(180)(img,label)
+            if self.train:
+                img, label = randFlip(mode="random", rate=0.5)(img, label)
+                img, label = randRot(degree=180, rate=0.5)(img, label)
             img, label = self.transform["img"](img), self.transform["img"](label)
-            
         return img, label
 
     @staticmethod
@@ -71,17 +71,17 @@ class cell_seg_dataset(Dataset):
     def collate_fn(batch):
         pass
 
-def build_dataLoader(CFG, root, batch_size=32, split=0.8, transform=None):
+def build_dataLoader(CFG, root, batch_size=32, split=0.8, transform=None, train=True):
     file_list = cell_seg_dataset._get_imgs_name(list(os.listdir(root)))
     random.shuffle(file_list)
     lth = len(file_list)
     train_cnt = int(lth * split)
 
-    train_dataset = cell_seg_dataset(root, transform=transform, file_list=file_list[:train_cnt]) 
+    train_dataset = cell_seg_dataset(root, transform=transform, file_list=file_list[:train_cnt], train=train) 
     train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers)
 
     if split != 1:
-        val_dataset = cell_seg_dataset(root, transform=transform, file_list=file_list[train_cnt:]) 
+        val_dataset = cell_seg_dataset(root, transform=transform, file_list=file_list[train_cnt:],train=False) 
         val_dataLoader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers)
 
         return train_dataLoader, val_dataLoader
@@ -92,12 +92,34 @@ def build_dataLoader(CFG, root, batch_size=32, split=0.8, transform=None):
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> 2,build_transforms <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< 
 # ============================================================================================================= 
 class randRot(nn.Module):
-    def __init__(self, degree):
+    def __init__(self, degree, hard=False, rate=1):
         super(randRot, self).__init__()
-        self.degree = np.random.randint(-degree, degree)
+        self.rot = np.random.uniform() < rate
+        self.degree = np.random.randint(-degree, degree) if not hard else degree
 
     def forward(self, img, label):
-        return Tf.rotate(img, self.degree, fill=255), Tf.rotate(label, self.degree, fill=0)
+        if self.rot:
+            return Tf.rotate(img, self.degree, fill=255), Tf.rotate(label, self.degree, fill=0)
+        else:
+            return img, label
+
+class randFlip(nn.Module):
+    def __init__(self,mode="random", rate=0.5):
+        super(randFlip, self).__init__()
+        self.flip = np.random.uniform() < rate
+        self.mode = mode
+
+    def forward(self, img, label):
+        if self.flip:
+            if self.mode == "random":
+                flips = np.random.choice(a=[Tf.hflip, Tf.vflip])
+            if self.mode == "vertical":
+                flips = Tf.vflip
+            if self.mode == "horizontal":
+                flips = Tf.hflip
+            return flips(img=img), flips(img=label)
+        else:
+            return img, label
 
 def build_transforms(CFG):
     rand_rot = [T.RandomVerticalFlip(p=1), T.RandomHorizontalFlip(p=1), T.Compose([T.RandomVerticalFlip(p=1), T.RandomHorizontalFlip(p=1)]), T.Compose([])]
@@ -258,7 +280,7 @@ def valid_one_epoch(CFG,  model, valid_loader):
 @torch.no_grad()
 def test_one_epoch(CFG, model, test_loader, view=True):
     model.to(CFG.device)
-    ckpt = os.path.join(CFG.ckpt_path, "best_epoch_235.pth")
+    ckpt = os.path.join(CFG.ckpt_path, "best_epoch.pth")
     assert os.path.isfile(ckpt), "checkpoints not exists ... ..."
     state_dict = torch.load(ckpt)
     model.load_state_dict(state_dict)
@@ -271,20 +293,34 @@ def test_one_epoch(CFG, model, test_loader, view=True):
         images = images.to(CFG.device)
         masks = masks.to(CFG.device)
 
-        outputs = model(images)
+        outputs = tta_pred(model, images, masks) if CFG.tta else model(images)[0]
         if CFG.thr:
-            outputs[0][outputs[0] > CFG.thr] = 1
-            outputs[0][outputs[0] < CFG.thr] = 0
+            outputs[outputs > CFG.thr] = 1
+            outputs[outputs < CFG.thr] = 0
         # pdb.set_trace()
         viewer(images, masks, outputs[0], waitKey=1)
 
-        dice += metric(outputs[0], masks).cpu().detach().numpy().tolist()
+        dice += metric(outputs, masks).cpu().detach().numpy().tolist()
     
     dice = np.mean(np.array(dice))
     print("Test dice {:.4f}".format(dice), flush=True)
     return dice
 
+def tta_pred(model, images, masks):
+    rotation_list = [0]# [0, 90, 180, 270]
+    flips_list = ["horizontal", "vertical"]
+    N = len(rotation_list)
+    preds = torch.zeros_like(masks)
+    for degree in rotation_list:
+        rot = randRot(degree,hard=True)
+        inv_rot = randRot(-degree,hard=True)
+        preds += inv_rot(images, model(rot(images, masks)[0])[0])[-1]
 
+    for f in flips_list:
+        flip = randFlip(mode=f, rate=1)
+        preds += flip(images, model(flip(images, masks)[0])[0])[-1]
+    preds /= float(N + 2)
+    return preds
 
 # ===========================================================================================
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> utils <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -332,12 +368,14 @@ if __name__ == "__main__":
         device = "cuda" if torch.cuda.is_available() else "cpu"
         train_data = r"F:\data\cell_segmentation\train_data"
         test_data = r"F:\data\cell_segmentation\test_data"
-        ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0]}{img_size[1]}_thr{thr}_{n_fold}fold_with_warmup_mish")
-        # ckpt_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 1)"
+        # ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0]}{img_size[1]}_thr{0.5}_{n_fold}fold_with_warmup_mish")
+        ckpt_path = r"F:\simple-U2Net\U-2-Net-master\ckpt_U2Net_800_512_512_thr0.5_with_warmup_leaky_randrot"
 
         resume = True
+        resume_path = r"F:\code\cell_seg\ckpt_U2Net_150_512512_thr0.5_4fold_with_warmup_mish\best_epoch.pth"
+
         warm_up_epoch = 20
-        resume_path = r"F:\code\cell_seg\ckpt_U2Net_150_102400_thr0.5(version1 try 1)\best_epoch_512_7283.pth"
+        tta = True #False
 
     # model = build_model().to(CFG.device)
     # train_transforms = build_transforms(CFG)["train"]
@@ -353,7 +391,7 @@ if __name__ == "__main__":
         os.makedirs(CFG.ckpt_path)
     
     model = build_model()
-    train_flag = True
+    train_flag = False
     if train_flag:
         if CFG.resume:
             assert os.path.isfile(CFG.resume_path), "resume not exist ... ..."
@@ -404,10 +442,10 @@ if __name__ == "__main__":
             epoch_time = time.time() - start_time
             print("epoch:{}, time:{:.2f}s\n".format(epoch, epoch_time), flush=True)
     
-    test_flag = False
+    test_flag = True
     if test_flag:
         model = build_model()
         transform = build_transforms(CFG)["valid_test"]
-        test_dataloader = build_dataLoader(CFG, CFG.test_data,batch_size=1, transform=transform, split=1)
+        test_dataloader = build_dataLoader(CFG, CFG.test_data,batch_size=1, transform=transform, split=1, train=False)
         train_dataLoader, val_dataLoader = build_dataLoader(CFG,CFG.train_data, batch_size=CFG.train_bs, transform=transform)
         test_one_epoch(CFG, model, test_dataloader)

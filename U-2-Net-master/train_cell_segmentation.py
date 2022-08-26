@@ -21,12 +21,12 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.transforms.functional as Tf
 
-from PIL import Image
 from tqdm import tqdm
 from model import U2NET, U2NETP
-from sklearn.model_selection import StratifiedGroupKFold
+from PIL import Image, ImageFilter
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
+from sklearn.model_selection import StratifiedGroupKFold
 
 # ============================================================================
 # >>>>>>>>>>>>>>>>>>>>>>>>>> 1 build_dataset <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -51,6 +51,8 @@ class cell_seg_dataset(Dataset):
         img = Image.open(img).convert("RGB")
         label = os.path.join(self.root, image + "_label.png")
         label = Image.open(label).convert("L")
+        if self.train:
+            label = label.filter(ImageFilter.GaussianBlur(radius=1.4))
         if self.transform is not None:
             if self.train:
                 img, label = randFlip(mode="random", rate=0.5)(img, label)
@@ -372,7 +374,7 @@ if __name__ == "__main__":
         ckpt_path = r"F:\simple-U2Net\U-2-Net-master\ckpt_U2Net_800_512_512_thr0.5_with_warmup_leaky_randrot"
 
         resume = True
-        resume_path = r"F:\code\cell_seg\ckpt_U2Net_150_512512_thr0.5_4fold_with_warmup_mish\best_epoch.pth"
+        resume_path = r"F:\simple-U2Net\U-2-Net-master\ckpt_U2Net_800_512_512_thr0.5_with_warmup_leaky_randrot\best_epoch_7960.pth"
 
         warm_up_epoch = 20
         tta = True #False
@@ -391,7 +393,7 @@ if __name__ == "__main__":
         os.makedirs(CFG.ckpt_path)
     
     model = build_model()
-    train_flag = False
+    train_flag = True
     if train_flag:
         if CFG.resume:
             assert os.path.isfile(CFG.resume_path), "resume not exist ... ..."

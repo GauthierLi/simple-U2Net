@@ -18,6 +18,7 @@ import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import torch.distributed as dist
 import torchvision.transforms as T
 import torchvision.transforms.functional as Tf
 
@@ -80,11 +81,19 @@ def build_dataLoader(CFG, root, batch_size=32, split=0.8, transform=None, train=
     train_cnt = int(lth * split)
 
     train_dataset = cell_seg_dataset(root, transform=transform, file_list=file_list[:train_cnt], train=train) 
-    train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers)
+    if CFG.DDP:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
+        train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers, sampler=train_sampler)
+    else:
+        train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers)
 
     if split != 1:
         val_dataset = cell_seg_dataset(root, transform=transform, file_list=file_list[train_cnt:],train=False) 
-        val_dataLoader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers)
+        if CFG.DDP:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=True)
+            val_dataLoader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers, sampler=val_sampler)
+        else:
+            val_dataLoader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, collate_fn=default_collate, num_workers=CFG.num_workers)
 
         return train_dataLoader, val_dataLoader
     else:
@@ -215,8 +224,10 @@ def train_one_epoch(CFG, model, train_loader, optimizer):
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Train", file=sys.stdout)
 
     for _, (images, masks) in pbar:
-        images = images.to(CFG.device, dtype=torch.float)
-        masks = masks.to(CFG.device, dtype=torch.float)
+        if CFG.DDP:
+            images, masks = images.cuda(non_blocking=True), masks.cuda(non_blocking=True)
+        else:
+            images, masks = images.to(CFG.device, dtype=torch.float), masks.to(CFG.device, dtype=torch.float)
         losses = build_loss()
         optimizer.zero_grad()
     
@@ -282,7 +293,7 @@ def valid_one_epoch(CFG,  model, valid_loader):
 @torch.no_grad()
 def test_one_epoch(CFG, model, test_loader, view=True):
     model.to(CFG.device)
-    ckpt = os.path.join(CFG.ckpt_path, "best_epoch.pth")
+    ckpt = os.path.join(CFG.ckpt_path, "best_epoch_7960.pth")
     assert os.path.isfile(ckpt), "checkpoints not exists ... ..."
     state_dict = torch.load(ckpt)
     model.load_state_dict(state_dict)
@@ -309,9 +320,11 @@ def test_one_epoch(CFG, model, test_loader, view=True):
     return dice
 
 def tta_pred(model, images, masks):
-    rotation_list = [0]# [0, 90, 180, 270]
-    flips_list = ["horizontal", "vertical"]
-    N = len(rotation_list)
+    rotation_list = [0, 90, 180, 270] # [0]
+    flips_list = [] #["horizontal", "vertical"]
+    Nr = len(rotation_list)
+    Nf = len(flips_list)
+    N = Nr + Nf
     preds = torch.zeros_like(masks)
     for degree in rotation_list:
         rot = randRot(degree,hard=True)
@@ -321,7 +334,7 @@ def tta_pred(model, images, masks):
     for f in flips_list:
         flip = randFlip(mode=f, rate=1)
         preds += flip(images, model(flip(images, masks)[0])[0])[-1]
-    preds /= float(N + 2)
+    preds /= float(N)
     return preds
 
 # ===========================================================================================
@@ -367,7 +380,6 @@ if __name__ == "__main__":
         thr = 0.5
         early_stop = True
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         train_data = r"F:\data\cell_segmentation\train_data"
         test_data = r"F:\data\cell_segmentation\test_data"
         # ckpt_path = os.path.join(os.getcwd(), f"ckpt_U2Net_{epoch}_{img_size[0]}{img_size[1]}_thr{0.5}_{n_fold}fold_with_warmup_mish")
@@ -378,6 +390,16 @@ if __name__ == "__main__":
 
         warm_up_epoch = 20
         tta = True #False
+
+        DDP = False
+        if DDP:
+            rank = int(os.environ["RANK"])
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(rank % torch.cuda.device_count())
+            dist.init_process_group(backend="nccl")
+            device = torch.device("cuda", local_rank)
+        else:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # model = build_model().to(CFG.device)
     # train_transforms = build_transforms(CFG)["train"]
@@ -391,6 +413,7 @@ if __name__ == "__main__":
     #     break
     if not os.path.exists(CFG.ckpt_path):
         os.makedirs(CFG.ckpt_path)
+    
     
     model = build_model()
     train_flag = True
@@ -407,7 +430,7 @@ if __name__ == "__main__":
 
         train_dataLoader, val_dataLoader = build_dataLoader(CFG,CFG.train_data, batch_size=CFG.train_bs, transform=train_transforms)
         
-        lr_scheduler_flag = True
+        lr_scheduler_flag = False
         
         best_val_dice = 0
         best_epoch = 0
@@ -434,10 +457,10 @@ if __name__ == "__main__":
             if dice > best_val_dice:
                 print("Saving best epoch ... ....", flush=True)
                 best_val_dice = dice
-                torch.save(model.state_dict(),os.path.join(CFG.ckpt_path, "best_epoch.pth"))
+                torch.save(model.module.cpu().state_dict(),os.path.join(CFG.ckpt_path, "best_epoch.pth"))
             
             print("saving last epoch ... ...", flush=True)
-            torch.save(model.state_dict(),os.path.join(CFG.ckpt_path, f"epoch_{epoch}.pth"))
+            torch.save(model.module.cpu().state_dict(),os.path.join(CFG.ckpt_path, f"epoch_{epoch}.pth"))
             if os.path.isfile(os.path.join(CFG.ckpt_path, f"epoch_{epoch - 1}.pth")):
                 os.remove(os.path.join(CFG.ckpt_path, f"epoch_{epoch - 1}.pth"))
 

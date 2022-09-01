@@ -1,3 +1,4 @@
+import pdb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -387,6 +388,7 @@ class U2NET(nn.Module):
 
         #stage 6
         hx6 = self.stage6(hx)
+        pdb.set_trace()
         hx6up = _upsample_like(hx6,hx5)
 
         #-------------------- decoder --------------------
